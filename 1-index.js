@@ -1,5 +1,5 @@
-// AI Act Article 50 Transparency Checker - Telegram bot + web report on Cloudflare Workers
-// Free tier only: no LLM, pure heuristic scan. KV for rate limits and 7-day reports.
+// AI Act Article 50 Transparency Checker - Telegram bot + web report on Deno Deploy (free tier)
+// No LLM, pure heuristic scan. Deno KV for rate limits and 7-day reports.
 
 const VERSION = "0.1.0";
 const DAILY_USER_LIMIT = 10;
@@ -185,7 +185,7 @@ function normalizeUrl(raw) {
   let url;
   try { url = new URL(u); } catch { return null; }
   if (!/^https?:$/.test(url.protocol)) return null;
-  if (!/^(?!.*\.\.)[a-z0-9.-]+\.[a-z]{2,}(:\d{1,5})?$/i.test(url.host)) return null;
+  if (!/^(?!.*\.\.)[a-z0-9][a-z0-9.-]*\.[a-z0-9.-]+(:\d{1,5})?$/i.test(url.host)) return null;
   return url;
 }
 
@@ -352,9 +352,9 @@ function todayKey() {
 }
 
 async function bumpCounter(kv, key, limit) {
-  const cur = parseInt((await kv.get(key)) || "0", 10);
+  const cur = parseInt((await kv.get(["ctr", key])).value || "0", 10);
   if (cur >= limit) return { ok: false, count: cur };
-  await kv.put(key, String(cur + 1), { expirationTtl: 60 * 60 * 36 });
+  await kv.set(["ctr", key], String(cur + 1), { expireIn: 60 * 60 * 36 * 1000 });
   return { ok: true, count: cur + 1 };
 }
 
@@ -378,7 +378,7 @@ async function runScanAndStore(env, urlRaw) {
   const report = {
     id, url: url.toString(), finalUrl: page.finalUrl, scannedAt: new Date().toISOString(), ...result,
   };
-  await env.CHECKER.put("rep:" + id, JSON.stringify(report), { expirationTtl: REPORT_TTL_SECONDS });
+  await kv.set(["rep", id], JSON.stringify(report), { expireIn: REPORT_TTL_SECONDS * 1000 });
   return { report };
 }
 
@@ -431,10 +431,18 @@ small,.muted{color:#6b7280}</style></head><body>
 </body></html>`;
 }
 
-// ---------------- Worker entry ----------------
+// ---------------- Server entry (Deno Deploy) ----------------
 
-export default {
-  async fetch(request, env) {
+const kv = await Deno.openKv(Deno.env.get("KV_PATH") || undefined);
+
+const env = {
+  get BOT_TOKEN() { return Deno.env.get("BOT_TOKEN") || ""; },
+  get WEBHOOK_SECRET() { return Deno.env.get("WEBHOOK_SECRET") || ""; },
+  get WORKER_ORIGIN() { return Deno.env.get("WORKER_ORIGIN") || ""; },
+  get BOT_USERNAME() { return Deno.env.get("BOT_USERNAME") || ""; },
+};
+
+async function handle(request) {
     const url = new URL(request.url);
 
     if (url.pathname === "/health") {
@@ -447,7 +455,7 @@ export default {
 
     if (url.pathname.startsWith("/r/")) {
       const id = url.pathname.slice(3).replace(/[^A-Za-z0-9]/g, "");
-      const raw = await env.CHECKER.get("rep:" + id);
+      const raw = (await kv.get(["rep", id])).value;
       if (!raw) return new Response("Report not found or expired.", { status: 404 });
       return new Response(reportHtml(JSON.parse(raw)), { headers: { "content-type": "text/html; charset=utf-8" } });
     }
@@ -455,7 +463,7 @@ export default {
     if (url.pathname === "/scan" && request.method === "GET") {
       const target = url.searchParams.get("url");
       if (!target) return Response.json({ ok: false, error: "missing url param" }, { status: 400 });
-      const gate = await bumpCounter(env.CHECKER, "api:" + todayKey(), DAILY_GLOBAL_API_LIMIT);
+      const gate = await bumpCounter(kv, "api:" + todayKey(), DAILY_GLOBAL_API_LIMIT);
       if (!gate.ok) return Response.json({ ok: false, error: "daily api limit reached" }, { status: 429 });
       const r = await runScanAndStore(env, target);
       if (r.error) return Response.json({ ok: false, ...r }, { status: 422 });
@@ -485,7 +493,7 @@ export default {
       const candidate = extractUrl(text);
       if (!candidate) { await reply(t(L, "invalid_url")); return Response.json({ ok: true }); }
 
-      const gate = await bumpCounter(env.CHECKER, "rl:" + chatId + ":" + todayKey(), DAILY_USER_LIMIT);
+      const gate = await bumpCounter(kv, "rl:" + chatId + ":" + todayKey(), DAILY_USER_LIMIT);
       if (!gate.ok) { await reply(t(L, "limit", { n: DAILY_USER_LIMIT })); return Response.json({ ok: true }); }
 
       await reply(t(L, "scanning", { url: candidate }));
@@ -498,5 +506,10 @@ export default {
     }
 
     return new Response("not found", { status: 404 });
-  },
-};
+}
+
+if (import.meta.main || Deno.env.get("DENO_DEPLOYMENT_ID")) {
+  Deno.serve(handle);
+}
+
+export { handle, scan, normalizeUrl };
