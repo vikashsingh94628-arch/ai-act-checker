@@ -1,0 +1,10 @@
+{
+  "name": "ai-act-checker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "EU AI Act Article 50 transparency checker - Telegram bot on Netlify Functions (free tier)",
+  "dependencies": {
+    "@netlify/blobs": "^8.0.0"
+  }
+}
